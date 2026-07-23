@@ -36,7 +36,27 @@ const PORT = process.env.PORT || 3005;
 
 const SHEET_ID = process.env.SHEET_ID || '1ZDANpTkxJ-42T1RbZogx2z_LbECAwUAfon9V546U8qg';
 const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || '';
-const PRIVATE_KEY = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+
+// Pasting a service-account key into a hosting dashboard mangles it in a few
+// predictable ways: the surrounding quotes from the JSON value survive, the
+// "\n" escapes stay literal, or the real newlines get flattened to spaces.
+// Any of those produce "DECODER routines::unsupported" from crypto.sign, so
+// normalise all of them back into a well-formed PEM here.
+function normalizePrivateKey(raw) {
+  let k = String(raw || '').trim();
+  if (k.length > 1 && ((k[0] === '"' && k[k.length - 1] === '"') ||
+                       (k[0] === "'" && k[k.length - 1] === "'"))) {
+    k = k.slice(1, -1);
+  }
+  k = k.replace(/\\r/g, '').replace(/\\n/g, '\n').replace(/\r/g, '');
+  const m = k.match(/-----BEGIN ([A-Z ]+)-----([\s\S]*?)-----END \1-----/);
+  if (!m) return k;
+  const body = m[2].replace(/\s+/g, '');            // strip however it was wrapped
+  const lines = body.match(/.{1,64}/g) || [];       // and re-wrap at PEM's 64 cols
+  return '-----BEGIN ' + m[1] + '-----\n' + lines.join('\n') + '\n-----END ' + m[1] + '-----\n';
+}
+
+const PRIVATE_KEY = normalizePrivateKey(process.env.GOOGLE_PRIVATE_KEY);
 
 const TAB_SALES = 'FocusSubDept';
 const TAB_ISSUES = 'IssuesAndConcerns';
@@ -380,17 +400,36 @@ app.delete('/api/issues/:row', async (req, res) => {
   }
 });
 
+// Reports whether the private key is a usable PEM without ever echoing it.
+function keyDiagnostics() {
+  if (!PRIVATE_KEY) return { present: false, usable: false, note: 'GOOGLE_PRIVATE_KEY is not set' };
+  const d = {
+    present: true,
+    startsWithHeader: PRIVATE_KEY.indexOf('-----BEGIN') === 0,
+    lineCount: PRIVATE_KEY.split('\n').length,
+    length: PRIVATE_KEY.length,
+  };
+  try {
+    crypto.createPrivateKey(PRIVATE_KEY);
+    d.usable = true;
+  } catch (e) {
+    d.usable = false;
+    d.note = 'Key will not parse (' + e.message + '). Re-copy private_key from the ' +
+             'service account JSON, including the BEGIN/END lines.';
+  }
+  return d;
+}
+
 app.get('/api/health', async (req, res) => {
+  const base = { serviceAccount: CLIENT_EMAIL || '(not set)', sheetId: SHEET_ID, privateKey: keyDiagnostics() };
   try {
     const meta = await sheetsApi('GET', '?fields=properties.title,sheets.properties.title');
-    res.json({
-      ok: true,
+    res.json(Object.assign({ ok: true,
       title: meta.properties && meta.properties.title,
       tabs: (meta.sheets || []).map((s) => s.properties.title),
-      serviceAccount: CLIENT_EMAIL || '(not set)',
-    });
+    }, base));
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message, serviceAccount: CLIENT_EMAIL || '(not set)' });
+    res.status(500).json(Object.assign({ ok: false, error: e.message }, base));
   }
 });
 
