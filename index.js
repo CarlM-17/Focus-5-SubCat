@@ -172,19 +172,6 @@ async function readRange(a1) {
   return data.values || [];
 }
 
-const gidCache = {};
-async function getTabGid(title) {
-  if (gidCache[title] !== undefined) return gidCache[title];
-  const meta = await sheetsApi('GET', '?fields=sheets.properties');
-  const all = meta.sheets || [];
-  const target = title.trim().toLowerCase();
-  const sheet = all.find((s) => s.properties.title === title)
-    || all.find((s) => s.properties.title.trim().toLowerCase() === target);
-  if (!sheet) throw new Error('Tab "' + title + '" not found. Tabs: ' + all.map((s) => s.properties.title).join(', '));
-  gidCache[title] = sheet.properties.sheetId;
-  return gidCache[title];
-}
-
 /* ============================================================================
  *  HELPERS
  * ==========================================================================*/
@@ -291,13 +278,48 @@ async function loadSales(storeById) {
   return out;
 }
 
+/* ============================================================================
+ *  CACHE — Google allows roughly 60 reads/minute for one service account, and
+ *  every viewer shares this one account. Without this, 40 people refreshing
+ *  would exhaust the quota in seconds. Concurrent callers also share a single
+ *  in-flight request, so a burst of viewers costs one Google call, not forty.
+ * ==========================================================================*/
+const CACHE = {};
+function cached(key, ttlMs, loader) {
+  const e = CACHE[key];
+  if (e && e.inflight) return e.inflight;                       // join the in-flight fetch
+  if (e && ttlMs > 0 && Date.now() - e.at < ttlMs) return Promise.resolve(e.value);
+  const p = loader().then((v) => {
+    CACHE[key] = { value: v, at: Date.now() };
+    return v;
+  }, (err) => {
+    delete CACHE[key];
+    throw err;
+  });
+  CACHE[key] = { inflight: p, value: e && e.value, at: e ? e.at : 0 };
+  return p;
+}
+
+const DATA_TTL = 120000;   // stores / focus list / monthly sales change rarely
+const ISSUES_TTL = 20000;  // the consolidated issue log changes as stores file things
+
+async function loadReference() {
+  const stores = await loadStores();
+  const storeById = {};
+  stores.forEach((s) => { storeById[s.storeId] = s; });
+  const [focusList, sales] = await Promise.all([loadFocusList(), loadSales(storeById)]);
+  return { stores: stores, storeById: storeById, focusList: focusList, sales: sales };
+}
+
 app.get('/api/data', async (req, res) => {
   try {
-    const stores = await loadStores();
-    const storeById = {};
-    stores.forEach((s) => { storeById[s.storeId] = s; });
-    const [focusList, sales] = await Promise.all([loadFocusList(), loadSales(storeById)]);
-    res.json({ stores: stores, focusList: focusList, sales: sales, months: MONTHS, today: todayISO() });
+    // The Refresh button sends ?fresh=1; concurrent refreshes still coalesce.
+    const ttl = req.query.fresh ? 0 : DATA_TTL;
+    const ref = await cached('reference', ttl, loadReference);
+    res.json({
+      stores: ref.stores, focusList: ref.focusList, sales: ref.sales,
+      months: MONTHS, today: todayISO(),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -307,12 +329,19 @@ app.get('/api/data', async (req, res) => {
  *  ISSUE LOG
  * ==========================================================================*/
 
-// The IssuesAndConcerns tab does not start at row 1: there is a blank row, the
-// header row, a row of input hints ("Enter Store ID", "Auto", ...) and a few
-// stray data-validation lists. Find the header row, then keep only rows that
-// look like real entries.
-async function loadIssues() {
-  const rows = await readRange(TAB_ISSUES + '!A1:' + ISSUE_LAST_COL + '2000');
+// IssuesAndConcerns is fed by IMPORTRANGE from the 31 store copies, so this is
+// strictly read-only: writing into a range that holds an IMPORTRANGE formula
+// destroys the formula and #REF!s the whole import.
+//
+// The tab does not start at row 1 (blank row, header row, then a row of input
+// hints and some stray validation lists), and IMPORTRANGE adds its own failure
+// modes: "#REF!" when access hasn't been granted, "#N/A" while a source is
+// still loading. Locate the header, keep only rows that look like entries, and
+// report the formula errors rather than presenting them as data.
+const SHEET_ERRORS = ['#REF!', '#N/A', '#ERROR!', '#VALUE!', '#NAME?', 'Loading...'];
+
+async function loadIssues(storeById) {
+  const rows = await readRange(TAB_ISSUES + '!A1:' + ISSUE_LAST_COL + '5000');
   let headerRow = -1;
   for (let i = 0; i < Math.min(rows.length, 20); i++) {
     if (txt((rows[i] || [])[0]).toLowerCase() === 'store id') { headerRow = i; break; }
@@ -320,85 +349,56 @@ async function loadIssues() {
   if (headerRow === -1) throw new Error('Could not find the "Store ID" header row in ' + TAB_ISSUES);
 
   const out = [];
+  const importErrors = [];
   for (let i = headerRow + 1; i < rows.length; i++) {
     const r = rows[i] || [];
     const storeId = txt(r[0]);
-    if (!storeId) continue;                                   // blank / validation-list rows
+    if (!storeId) continue;                                      // blank / validation-list rows
     if (storeId.toLowerCase().indexOf('enter ') === 0) continue; // the hint row
-    const rec = { row: i + 1 };                               // 1-based sheet row
+    if (SHEET_ERRORS.indexOf(storeId) !== -1) {                  // a failing IMPORTRANGE
+      if (importErrors.indexOf(storeId) === -1) importErrors.push(storeId);
+      continue;
+    }
+    const rec = { row: i + 1 };
     ISSUE_FIELDS.forEach((f, idx) => { rec[f] = txt(r[idx]); });
-    // Unresolved issues keep counting, so days open is always recomputed.
+    // Store copies may leave Area / Store Name blank, so fill them from
+    // ListOfStores, which is the authority for the store roster.
+    const store = storeById && storeById[rec.storeId];
+    if (store) {
+      if (!rec.area) rec.area = store.area;
+      if (!rec.storeName) rec.storeName = store.storeName;
+    }
+    // Unresolved issues keep counting, so days open is always recomputed here
+    // rather than trusting whatever the source sheet last calculated.
     rec.daysOpen = computeDaysOpen(rec.dateReported, rec.dateResolved);
+    rec.isOpen = rec.resolved.toUpperCase() !== 'Y';
     out.push(rec);
   }
-  return { headerRow: headerRow + 1, rows: out };
-}
-
-function issueToRow(rec) {
-  const clean = {};
-  ISSUE_FIELDS.forEach((f) => { clean[f] = txt(rec[f]); });
-  if (!clean.date) clean.date = todayISO();
-  if (clean.resolved.toUpperCase() !== 'Y') clean.dateResolved = '';
-  clean.daysOpen = String(computeDaysOpen(clean.dateReported, clean.dateResolved));
-  return ISSUE_FIELDS.map((f) => clean[f]);
+  return { headerRow: headerRow + 1, rows: out, importErrors: importErrors };
 }
 
 app.get('/api/issues', async (req, res) => {
   try {
-    res.json(await loadIssues());
+    const ttl = req.query.fresh ? 0 : ISSUES_TTL;
+    const ref = await cached('reference', DATA_TTL, loadReference);
+    const data = await cached('issues', ttl, () => loadIssues(ref.storeById));
+    res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.post('/api/issues', async (req, res) => {
-  try {
-    const values = issueToRow(req.body || {});
-    if (!values[0]) return res.status(400).json({ error: 'Store ID is required' });
-    const result = await sheetsApi(
-      'POST',
-      '/values/' + encodeURIComponent(TAB_ISSUES + '!A:' + ISSUE_LAST_COL) +
-        ':append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS',
-      { values: [values] }
-    );
-    res.json({ ok: true, updatedRange: result.updates && result.updates.updatedRange });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.put('/api/issues/:row', async (req, res) => {
-  try {
-    const row = parseInt(req.params.row, 10);
-    if (!row || row < 2) return res.status(400).json({ error: 'Bad row number' });
-    const values = issueToRow(req.body || {});
-    if (!values[0]) return res.status(400).json({ error: 'Store ID is required' });
-    const range = TAB_ISSUES + '!A' + row + ':' + ISSUE_LAST_COL + row;
-    await sheetsApi('PUT', '/values/' + encodeURIComponent(range) + '?valueInputOption=USER_ENTERED',
-      { values: [values] });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.delete('/api/issues/:row', async (req, res) => {
-  try {
-    const row = parseInt(req.params.row, 10);
-    if (!row || row < 2) return res.status(400).json({ error: 'Bad row number' });
-    const gid = await getTabGid(TAB_ISSUES);
-    await sheetsApi('POST', ':batchUpdate', {
-      requests: [{
-        deleteDimension: {
-          range: { sheetId: gid, dimension: 'ROWS', startIndex: row - 1, endIndex: row },
-        },
-      }],
-    });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+// Writes are deliberately refused: the tab is IMPORTRANGE-driven and each store
+// files issues in its own copy of the sheet. GET is already answered above, so
+// these only ever see POST/PUT/DELETE.
+function issuesAreReadOnly(req, res) {
+  res.status(405).json({
+    error: 'The issue log is read-only here. IssuesAndConcerns is populated by ' +
+           'IMPORTRANGE from the store copies — file the issue in the store\'s own sheet.',
+  });
+}
+app.all('/api/issues', issuesAreReadOnly);
+app.all('/api/issues/:row', issuesAreReadOnly);
 
 // Reports whether the private key is a usable PEM without ever echoing it.
 function keyDiagnostics() {
@@ -528,16 +528,12 @@ table.matrix td.cell{text-align:center;font-weight:600}
 .p-Low{background:rgba(46,204,143,.18);color:var(--up)}
 .st-open{background:rgba(255,176,32,.18);color:var(--warn)}
 .st-closed{background:rgba(46,204,143,.18);color:var(--up)}
-.form-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-@media(max-width:1100px){.form-grid{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:620px){.form-grid{grid-template-columns:1fr}}
-.fld-wide{grid-column:1/-1}
-.fld small{text-transform:none;letter-spacing:0;color:#6c8099}
-.req{color:var(--down)}
-.form-actions{grid-column:1/-1;display:flex;align-items:center;gap:12px;margin-top:4px}
-.form-msg{font-size:12px;color:var(--muted)}
-.issue-filters{display:flex;gap:8px;flex-wrap:wrap}
-.issue-filters input{min-width:230px}
+.warn-bar{background:rgba(255,176,32,.12);border:1px solid rgba(255,176,32,.4);
+  border-left:4px solid var(--warn);color:#ffd88a;border-radius:8px;
+  padding:11px 14px;margin-bottom:14px;font-size:13px}
+table.data td.wrapcell{white-space:normal;min-width:150px;max-width:280px}
+table.data td.warn{color:var(--warn)}
+#qSearch{min-width:210px}
 .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(80px);
   background:#101b26;border:1px solid var(--line);border-left:4px solid var(--accent);
   padding:11px 18px;border-radius:8px;font-size:13px;opacity:0;transition:.25s;z-index:99}
@@ -618,73 +614,66 @@ table.matrix td.cell{text-align:center;font-weight:600}
 </section>
 
 <section id="tab-issues" class="tabpane">
-  <div class="card">
-    <div class="card-head">
-      <h2 id="formTitle">New Issue Entry</h2>
-      <button id="cancelEdit" class="btn btn-ghost btn-sm hidden" type="button">Cancel edit</button>
-    </div>
-    <form id="issueForm" class="form-grid" autocomplete="off">
-      <label class="fld">Store ID <span class="req">*</span>
-        <input id="iStoreId" list="storeIdList" placeholder="e.g. 105" required>
-        <datalist id="storeIdList"></datalist>
-      </label>
-      <label class="fld">Area <small>auto</small><input id="iArea" readonly class="auto"></label>
-      <label class="fld">Store Name <small>auto</small><input id="iStoreName" readonly class="auto"></label>
-      <label class="fld">Date <small>auto</small><input id="iDate" type="date" readonly class="auto"></label>
 
-      <label class="fld">Reported by<input id="iReportedBy" placeholder="Name"></label>
-      <label class="fld">Focus 5 Category<select id="iFocusCategory"></select></label>
-      <label class="fld">Issue Category
-        <select id="iIssueCategory">
-          <option value=""></option><option>Price</option><option>Delivery</option>
-          <option>Quality</option><option>CSL</option><option>Other</option>
+  <div id="importWarn" class="warn-bar hidden"></div>
+
+  <div class="filters">
+    <label>Area<select id="qArea"></select></label>
+    <label>Store<select id="qStore"></select></label>
+    <label>Focus 5<select id="qFocus"></select></label>
+    <label>Issue Category
+      <select id="qCategory">
+        <option value="">All categories</option><option>Price</option><option>Delivery</option>
+        <option>Quality</option><option>CSL</option><option>Other</option>
+      </select>
+    </label>
+    <label>Priority
+      <select id="qPriority">
+        <option value="">All priority</option><option>High</option>
+        <option>Medium</option><option>Low</option>
+      </select>
+    </label>
+    <label>Status
+      <select id="qResolved">
+        <option value="">All status</option><option value="open">Open only</option>
+        <option value="closed">Resolved only</option>
+      </select>
+    </label>
+    <label>Aging
+      <select id="qAging">
+        <option value="">Any age</option><option value="7">Open &gt; 7 days</option>
+        <option value="14">Open &gt; 14 days</option><option value="30">Open &gt; 30 days</option>
+      </select>
+    </label>
+    <label>Search<input id="qSearch" placeholder="Store, description, remarks..."></label>
+    <button id="qReset" class="btn btn-ghost" type="button">Reset</button>
+  </div>
+
+  <div id="issueKpis" class="kpis"></div>
+
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-head">
+        <h2>Open Issues</h2>
+        <select id="obBy" class="inline-select">
+          <option value="issueCategory">by Issue Category</option>
+          <option value="focusCategory">by Focus 5 Category</option>
+          <option value="area">by Area</option>
+          <option value="storeName">by Store</option>
         </select>
-      </label>
-      <label class="fld">Priority
-        <select id="iPriority">
-          <option value=""></option><option>Low</option><option>Medium</option><option>High</option>
-        </select>
-      </label>
-
-      <label class="fld fld-wide">Issue Description<textarea id="iIssueDescription" rows="2"></textarea></label>
-
-      <label class="fld">Reported to Buyer / MRG<input id="iReportedTo"></label>
-      <label class="fld">Date Reported<input id="iDateReported" type="date"></label>
-      <label class="fld">Date Resolved<input id="iDateResolved" type="date"></label>
-      <label class="fld">Days Open <small>auto</small><input id="iDaysOpen" readonly class="auto"></label>
-
-      <label class="fld fld-wide">Feedback<textarea id="iFeedback" rows="2"></textarea></label>
-      <label class="fld fld-wide">Resolution Details<textarea id="iResolutionDetails" rows="2"></textarea></label>
-      <label class="fld fld-wide">Remarks / Notes<textarea id="iRemarks" rows="2"></textarea></label>
-
-      <label class="fld">Resolved? [Y/N]
-        <select id="iResolved">
-          <option value=""></option><option value="Y">Y</option><option value="N">N</option>
-        </select>
-      </label>
-
-      <div class="form-actions">
-        <button id="saveBtn" class="btn btn-primary" type="submit">Save Entry</button>
-        <button id="clearBtn" class="btn btn-ghost" type="button">Clear</button>
-        <span id="formMsg" class="form-msg"></span>
       </div>
-    </form>
+      <div id="issueBreakdown" class="chart-wrap"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Aging of Open Issues</h2></div>
+      <div id="agingChart" class="chart-wrap"></div>
+    </div>
   </div>
 
   <div class="card">
     <div class="card-head">
-      <h2>Logged Issues</h2>
-      <div class="issue-filters">
-        <select id="qResolved">
-          <option value="">All status</option><option value="open">Open only</option>
-          <option value="closed">Resolved only</option>
-        </select>
-        <select id="qPriority">
-          <option value="">All priority</option><option>High</option>
-          <option>Medium</option><option>Low</option>
-        </select>
-        <input id="qSearch" placeholder="Search store, category, description...">
-      </div>
+      <h2>Consolidated Issue Log <small id="issueCount"></small></h2>
+      <span class="sync-note">Read-only &middot; stores file issues in their own sheet copy</span>
     </div>
     <div class="table-scroll"><table id="issueTable" class="data"></table></div>
   </div>
@@ -702,12 +691,10 @@ table.matrix td.cell{text-align:center;font-weight:600}
 
 var DATA = { stores: [], focusList: [], sales: [], months: [], today: '' };
 var ISSUES = [];
-var EDIT_ROW = null;
 var STORE_BY_ID = {};
 
 var MONTHS = ['January','February','March','April','May','June',
               'July','August','September','October','November','December'];
-var ISSUE_CATEGORIES = ['Price','Delivery','Quality','CSL','Other'];
 
 function $(id){ return document.getElementById(id); }
 function esc(s){
@@ -1107,252 +1094,292 @@ $('fReset').addEventListener('click', function(){
 
 /* ============================== ISSUE TAB ============================== */
 
-function buildIssueForm(){
-  var opts = '<option value=""></option>';
+/* The issue log is read-only: IssuesAndConcerns is fed by IMPORTRANGE from the
+   31 store copies, and each store files its issues in its own sheet. */
+
+function buildIssueFilters(){
+  var areas = uniq(DATA.stores.map(function(s){ return s.area; })).sort();
+  fillSelect($('qArea'), areas.map(function(a){ return { v:a, t:a }; }), 'All areas');
+
   var subs = DATA.focusList.length ? DATA.focusList : ['Rice','Poultry','Sugar','Eggs','Pork'];
-  subs.forEach(function(s){ opts += '<option>' + esc(s) + '</option>'; });
-  $('iFocusCategory').innerHTML = opts;
+  fillSelect($('qFocus'), subs.map(function(s){ return { v:s, t:s }; }), 'All Focus 5');
 
-  var dl = '';
-  DATA.stores.forEach(function(s){
-    dl += '<option value="' + esc(s.storeId) + '">' + esc(s.storeName + ' (' + s.area + ')') + '</option>';
-  });
-  $('storeIdList').innerHTML = dl;
-
-  $('iDate').value = DATA.today;
+  buildIssueStoreFilter();
 }
 
-function lookupStore(){
-  var id = $('iStoreId').value.trim();
-  var s = STORE_BY_ID[id];
-  $('iArea').value = s ? s.area : '';
-  $('iStoreName').value = s ? s.storeName : '';
-  if (id && !s) $('iStoreName').value = 'Store ID not in ListOfStores';
+function buildIssueStoreFilter(){
+  var area = $('qArea').value;
+  var opts = DATA.stores.filter(function(s){ return !area || s.area === area; })
+    .map(function(s){ return { v: s.storeId, t: s.storeId + ' - ' + s.storeName }; });
+  fillSelect($('qStore'), opts, 'All stores');
 }
-
-function recalcDays(){
-  var start = $('iDateReported').value;
-  if (!start) { $('iDaysOpen').value = ''; return; }
-  var a = new Date(start);
-  var endStr = $('iDateResolved').value;
-  var b = endStr ? new Date(endStr) : new Date();
-  var d = Math.floor((b - a) / 86400000);
-  $('iDaysOpen').value = d < 0 ? 0 : d;
-}
-
-$('iStoreId').addEventListener('input', lookupStore);
-$('iStoreId').addEventListener('change', lookupStore);
-$('iDateReported').addEventListener('change', recalcDays);
-$('iDateResolved').addEventListener('change', function(){
-  if ($('iDateResolved').value && $('iResolved').value !== 'Y') $('iResolved').value = 'Y';
-  recalcDays();
-});
-$('iResolved').addEventListener('change', function(){
-  // An unresolved issue must not carry a resolved date, or days open stops counting.
-  if ($('iResolved').value !== 'Y') $('iDateResolved').value = '';
-  recalcDays();
-});
-
-function formValues(){
-  return {
-    storeId: $('iStoreId').value.trim(),
-    area: $('iArea').value,
-    storeName: $('iStoreName').value,
-    date: $('iDate').value,
-    reportedBy: $('iReportedBy').value,
-    focusCategory: $('iFocusCategory').value,
-    issueCategory: $('iIssueCategory').value,
-    issueDescription: $('iIssueDescription').value,
-    priority: $('iPriority').value,
-    reportedTo: $('iReportedTo').value,
-    dateReported: $('iDateReported').value,
-    feedback: $('iFeedback').value,
-    resolutionDetails: $('iResolutionDetails').value,
-    dateResolved: $('iDateResolved').value,
-    daysOpen: $('iDaysOpen').value,
-    remarks: $('iRemarks').value,
-    resolved: $('iResolved').value
-  };
-}
-
-function clearForm(){
-  EDIT_ROW = null;
-  $('issueForm').reset();
-  $('iDate').value = DATA.today;
-  $('iArea').value = '';
-  $('iStoreName').value = '';
-  $('iDaysOpen').value = '';
-  $('formTitle').textContent = 'New Issue Entry';
-  $('saveBtn').textContent = 'Save Entry';
-  $('cancelEdit').classList.add('hidden');
-  $('formMsg').textContent = '';
-}
-
-function loadIntoForm(rec){
-  EDIT_ROW = rec.row;
-  $('iStoreId').value = rec.storeId;
-  $('iArea').value = rec.area;
-  $('iStoreName').value = rec.storeName;
-  $('iDate').value = toDateInput(rec.date) || DATA.today;
-  $('iReportedBy').value = rec.reportedBy;
-  $('iFocusCategory').value = rec.focusCategory;
-  $('iIssueCategory').value = rec.issueCategory;
-  $('iIssueDescription').value = rec.issueDescription;
-  $('iPriority').value = rec.priority;
-  $('iReportedTo').value = rec.reportedTo;
-  $('iDateReported').value = toDateInput(rec.dateReported);
-  $('iFeedback').value = rec.feedback;
-  $('iResolutionDetails').value = rec.resolutionDetails;
-  $('iDateResolved').value = toDateInput(rec.dateResolved);
-  $('iRemarks').value = rec.remarks;
-  $('iResolved').value = (rec.resolved || '').toUpperCase() === 'Y' ? 'Y' :
-                         ((rec.resolved || '').toUpperCase() === 'N' ? 'N' : '');
-  recalcDays();
-  $('formTitle').textContent = 'Editing row ' + rec.row;
-  $('saveBtn').textContent = 'Update Entry';
-  $('cancelEdit').classList.remove('hidden');
-  window.scrollTo({ top: 0, behavior: 'smooth' });
-}
-
-function toDateInput(v){
-  if (!v) return '';
-  var d = new Date(v);
-  if (isNaN(d.getTime())) return '';
-  var p = function(n){ return String(n).length < 2 ? '0' + n : String(n); };
-  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
-}
-
-$('issueForm').addEventListener('submit', function(ev){
-  ev.preventDefault();
-  var v = formValues();
-  if (!v.storeId) { toast('Store ID is required', true); return; }
-  if (!STORE_BY_ID[v.storeId]) { toast('Store ID ' + v.storeId + ' is not in ListOfStores', true); return; }
-  $('saveBtn').disabled = true;
-  $('formMsg').textContent = 'Saving...';
-  var p = EDIT_ROW ? api('PUT', '/api/issues/' + EDIT_ROW, v) : api('POST', '/api/issues', v);
-  p.then(function(){
-    toast(EDIT_ROW ? 'Row updated' : 'Issue logged');
-    clearForm();
-    return loadIssues();
-  }).catch(function(e){
-    toast(e.message, true);
-    $('formMsg').textContent = e.message;
-  }).then(function(){
-    $('saveBtn').disabled = false;
-  });
-});
-
-$('clearBtn').addEventListener('click', clearForm);
-$('cancelEdit').addEventListener('click', clearForm);
 
 function issueMatches(rec){
   var st = $('qResolved').value;
-  var isClosed = (rec.resolved || '').toUpperCase() === 'Y';
-  if (st === 'open' && isClosed) return false;
-  if (st === 'closed' && !isClosed) return false;
-  var pr = $('qPriority').value;
-  if (pr && rec.priority !== pr) return false;
+  if (st === 'open' && !rec.isOpen) return false;
+  if (st === 'closed' && rec.isOpen) return false;
+  if ($('qArea').value && rec.area !== $('qArea').value) return false;
+  if ($('qStore').value && rec.storeId !== $('qStore').value) return false;
+  if ($('qFocus').value && rec.focusCategory !== $('qFocus').value) return false;
+  if ($('qCategory').value && rec.issueCategory !== $('qCategory').value) return false;
+  if ($('qPriority').value && rec.priority !== $('qPriority').value) return false;
+
+  var age = $('qAging').value;
+  if (age) {
+    if (!rec.isOpen) return false;                       // aging only means anything while open
+    if (!(Number(rec.daysOpen) > Number(age))) return false;
+  }
+
   var q = $('qSearch').value.trim().toLowerCase();
   if (q) {
     var hay = [rec.storeId, rec.storeName, rec.area, rec.focusCategory, rec.issueCategory,
-               rec.issueDescription, rec.reportedBy, rec.remarks].join(' ').toLowerCase();
+               rec.issueDescription, rec.reportedBy, rec.reportedTo, rec.feedback,
+               rec.resolutionDetails, rec.remarks].join(' ').toLowerCase();
     if (hay.indexOf(q) === -1) return false;
   }
   return true;
 }
 
-function renderIssues(){
-  var rows = ISSUES.filter(issueMatches);
+function renderIssueKpis(rows){
+  var open = rows.filter(function(r){ return r.isOpen; });
+  var closed = rows.length - open.length;
+  var highOpen = open.filter(function(r){ return r.priority === 'High'; }).length;
+  var aged = open.filter(function(r){ return Number(r.daysOpen) > 14; }).length;
+
+  var avg = 0, oldest = 0, oldestStore = '';
+  open.forEach(function(r){
+    var d = Number(r.daysOpen) || 0;
+    avg += d;
+    if (d > oldest) { oldest = d; oldestStore = r.storeName || r.storeId; }
+  });
+  avg = open.length ? Math.round(avg / open.length) : 0;
+
+  var storesAffected = uniq(open.map(function(r){ return r.storeId; })).length;
+
+  var html = '';
+  html += kpi('Open Issues', String(open.length), storesAffected + ' store(s) affected',
+              open.length ? 'down' : 'up');
+  html += kpi('High Priority Open', String(highOpen),
+              highOpen ? 'needs escalation' : 'none outstanding', highOpen ? 'down' : 'up');
+  html += kpi('Ageing Over 14 Days', String(aged),
+              aged ? 'past follow-up window' : 'all within window', aged ? 'down' : 'up');
+  html += kpi('Avg Days Open', String(avg), 'across open issues', avg > 14 ? 'down' : '');
+  html += kpi('Oldest Open', oldest ? oldest + ' days' : '-', oldestStore || 'nothing open',
+              oldest > 14 ? 'down' : '');
+  html += kpi('Resolved', String(closed),
+              rows.length ? Math.round((closed / rows.length) * 100) + '% of all logged' : '-', 'up');
+  $('issueKpis').innerHTML = html;
+}
+
+function renderIssueBreakdown(rows){
+  var field = $('obBy').value;
+  var open = rows.filter(function(r){ return r.isOpen; });
+  if (!open.length) {
+    $('issueBreakdown').innerHTML = '<div class="empty">No open issues in this selection.</div>';
+    return;
+  }
+  var map = {};
+  open.forEach(function(r){
+    var k = r[field] || '(blank)';
+    if (!map[k]) map[k] = { label: k, total: 0, high: 0 };
+    map[k].total++;
+    if (r.priority === 'High') map[k].high++;
+  });
+  var list = [];
+  for (var k in map) if (map.hasOwnProperty(k)) list.push(map[k]);
+  list.sort(function(a, b){ return b.total - a.total; });
+
+  var rowH = 32, T = 10, B = 22, L = 150, R = 70;
+  var W = 620, pw = W - L - R;
+  var H = T + B + rowH * list.length;
+  var max = 1;
+  list.forEach(function(g){ max = Math.max(max, g.total); });
+
+  var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img">';
+  for (var i = 0; i < list.length; i++) {
+    var g = list[i];
+    var y = T + rowH * i + 6;
+    var len = (g.total / max) * pw;
+    var hiLen = (g.high / max) * pw;
+    svg += '<text x="' + (L - 10) + '" y="' + (y + 14) + '" fill="#e8eef5" font-size="12" ' +
+           'text-anchor="end">' + esc(g.label.length > 22 ? g.label.slice(0, 21) + '.' : g.label) + '</text>';
+    svg += '<rect x="' + L + '" y="' + y + '" width="' + Math.max(len, 1) + '" height="19" rx="3" ' +
+           'fill="#3ea6ff"><title>' + esc(g.label) + ': ' + g.total + ' open</title></rect>';
+    if (g.high) {
+      svg += '<rect x="' + L + '" y="' + y + '" width="' + Math.max(hiLen, 1) + '" height="19" rx="3" ' +
+             'fill="#ff5c72"><title>' + esc(g.label) + ': ' + g.high + ' high priority</title></rect>';
+    }
+    svg += '<text x="' + (L + len + 8) + '" y="' + (y + 14) + '" fill="#93a4b8" font-size="11">' +
+           g.total + (g.high ? ' (' + g.high + ' high)' : '') + '</text>';
+  }
+  svg += '</svg>';
+  $('issueBreakdown').innerHTML = svg;
+}
+
+function renderAging(rows){
+  var open = rows.filter(function(r){ return r.isOpen; });
+  if (!open.length) {
+    $('agingChart').innerHTML = '<div class="empty">No open issues in this selection.</div>';
+    return;
+  }
+  var buckets = [
+    { label: '0-7 days', min: 0, max: 7, color: '#2ecc8f', n: 0 },
+    { label: '8-14 days', min: 8, max: 14, color: '#ffb020', n: 0 },
+    { label: '15-30 days', min: 15, max: 30, color: '#ff8a3d', n: 0 },
+    { label: 'Over 30 days', min: 31, max: 1e9, color: '#ff5c72', n: 0 }
+  ];
+  open.forEach(function(r){
+    var d = Number(r.daysOpen) || 0;
+    for (var i = 0; i < buckets.length; i++) {
+      if (d >= buckets[i].min && d <= buckets[i].max) { buckets[i].n++; break; }
+    }
+  });
+
+  var W = 620, H = 260, L = 50, R = 20, T = 16, B = 46;
+  var pw = W - L - R, ph = H - T - B;
+  var max = 1;
+  buckets.forEach(function(b){ max = Math.max(max, b.n); });
+
+  var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img">';
+  for (var g = 0; g <= 4; g++) {
+    var gy = T + ph - (ph * g / 4);
+    svg += '<line x1="' + L + '" y1="' + gy + '" x2="' + (L + pw) + '" y2="' + gy +
+           '" stroke="#2b3a4c" stroke-width="1"/>';
+    svg += '<text x="' + (L - 8) + '" y="' + (gy + 4) + '" fill="#93a4b8" font-size="11" ' +
+           'text-anchor="end">' + Math.round(max * g / 4) + '</text>';
+  }
+  var slot = pw / buckets.length;
+  var bw = Math.min(70, slot * 0.55);
+  for (var i2 = 0; i2 < buckets.length; i2++) {
+    var b = buckets[i2];
+    var cx = L + slot * i2 + slot / 2;
+    var h = (b.n / max) * ph;
+    svg += '<rect x="' + (cx - bw / 2) + '" y="' + (T + ph - h) + '" width="' + bw +
+           '" height="' + Math.max(h, 0) + '" rx="4" fill="' + b.color + '"><title>' +
+           esc(b.label) + ': ' + b.n + ' open</title></rect>';
+    if (b.n) {
+      svg += '<text x="' + cx + '" y="' + (T + ph - h - 6) + '" fill="#e8eef5" font-size="12" ' +
+             'font-weight="700" text-anchor="middle">' + b.n + '</text>';
+    }
+    svg += '<text x="' + cx + '" y="' + (T + ph + 20) + '" fill="#93a4b8" font-size="11" ' +
+           'text-anchor="middle">' + esc(b.label) + '</text>';
+  }
+  svg += '</svg>';
+  $('agingChart').innerHTML = svg;
+}
+
+function renderIssueTable(rows){
+  var sorted = rows.slice().sort(function(a, b){
+    if (a.isOpen !== b.isOpen) return a.isOpen ? -1 : 1;   // open first
+    return (Number(b.daysOpen) || 0) - (Number(a.daysOpen) || 0);  // then oldest first
+  });
+
   var html = '<thead><tr>' +
     '<th>Store</th><th>Area</th><th>Date</th><th>Reported by</th><th>Focus 5</th>' +
     '<th>Category</th><th>Description</th><th>Priority</th><th>To Buyer/MRG</th>' +
-    '<th>Reported</th><th>Resolved</th><th class="n">Days Open</th><th>Status</th><th></th>' +
+    '<th>Reported</th><th>Feedback</th><th>Resolution</th><th>Resolved</th>' +
+    '<th class="n">Days Open</th><th>Remarks</th><th>Status</th>' +
     '</tr></thead><tbody>';
 
-  if (!rows.length) {
-    html += '<tr><td colspan="14" class="empty">No issues logged yet.</td></tr>';
+  if (!sorted.length) {
+    html += '<tr><td colspan="16" class="empty">No issues match these filters.</td></tr>';
   }
-  for (var i = 0; i < rows.length; i++) {
-    var r = rows[i];
-    var closed = (r.resolved || '').toUpperCase() === 'Y';
-    var desc = r.issueDescription || '';
-    if (desc.length > 44) desc = desc.slice(0, 43) + '.';
-    var dayCls = closed ? '' : (r.daysOpen > 14 ? 'down' : (r.daysOpen > 7 ? '' : ''));
+  for (var i = 0; i < sorted.length; i++) {
+    var r = sorted[i];
+    var days = Number(r.daysOpen) || 0;
+    var dayCls = r.isOpen ? (days > 30 ? 'down' : (days > 14 ? 'warn' : '')) : '';
     html += '<tr>' +
-      '<td>' + esc(r.storeId + ' - ' + r.storeName) + '</td>' +
+      '<td>' + esc(r.storeId + (r.storeName ? ' - ' + r.storeName : '')) + '</td>' +
       '<td>' + esc(r.area) + '</td>' +
       '<td>' + esc(r.date) + '</td>' +
       '<td>' + esc(r.reportedBy) + '</td>' +
       '<td>' + esc(r.focusCategory) + '</td>' +
       '<td>' + esc(r.issueCategory) + '</td>' +
-      '<td title="' + esc(r.issueDescription) + '">' + esc(desc) + '</td>' +
+      '<td class="wrapcell" title="' + esc(r.issueDescription) + '">' + esc(clip(r.issueDescription, 60)) + '</td>' +
       '<td>' + (r.priority ? '<span class="pill p-' + esc(r.priority) + '">' + esc(r.priority) + '</span>' : '') + '</td>' +
       '<td>' + esc(r.reportedTo) + '</td>' +
       '<td>' + esc(r.dateReported) + '</td>' +
+      '<td class="wrapcell" title="' + esc(r.feedback) + '">' + esc(clip(r.feedback, 40)) + '</td>' +
+      '<td class="wrapcell" title="' + esc(r.resolutionDetails) + '">' + esc(clip(r.resolutionDetails, 40)) + '</td>' +
       '<td>' + esc(r.dateResolved) + '</td>' +
       '<td class="n ' + dayCls + '">' + esc(r.daysOpen) + '</td>' +
-      '<td><span class="pill ' + (closed ? 'st-closed">Resolved' : 'st-open">Open') + '</span></td>' +
-      '<td><button class="btn btn-ghost btn-sm" data-edit="' + r.row + '" type="button">Edit</button> ' +
-      '<button class="btn btn-ghost btn-sm" data-del="' + r.row + '" type="button">Del</button></td>' +
+      '<td class="wrapcell" title="' + esc(r.remarks) + '">' + esc(clip(r.remarks, 30)) + '</td>' +
+      '<td><span class="pill ' + (r.isOpen ? 'st-open">Open' : 'st-closed">Resolved') + '</span></td>' +
       '</tr>';
   }
   html += '</tbody>';
   $('issueTable').innerHTML = html;
-
-  var eds = $('issueTable').querySelectorAll('[data-edit]');
-  for (var e = 0; e < eds.length; e++) {
-    eds[e].addEventListener('click', function(){
-      var row = parseInt(this.getAttribute('data-edit'), 10);
-      var rec = ISSUES.filter(function(x){ return x.row === row; })[0];
-      if (rec) loadIntoForm(rec);
-    });
-  }
-  var dels = $('issueTable').querySelectorAll('[data-del]');
-  for (var d = 0; d < dels.length; d++) {
-    dels[d].addEventListener('click', function(){
-      var row = parseInt(this.getAttribute('data-del'), 10);
-      if (!confirm('Delete issue row ' + row + ' from the sheet?')) return;
-      api('DELETE', '/api/issues/' + row).then(function(){
-        toast('Row deleted');
-        return loadIssues();
-      }).catch(function(err){ toast(err.message, true); });
-    });
-  }
+  $('issueCount').textContent = sorted.length === ISSUES.length
+    ? '(' + sorted.length + ')'
+    : '(' + sorted.length + ' of ' + ISSUES.length + ')';
 }
 
-['qResolved','qPriority','qSearch'].forEach(function(id){
-  $(id).addEventListener('input', renderIssues);
+function clip(s, n){
+  s = s || '';
+  return s.length > n ? s.slice(0, n - 1) + '.' : s;
+}
+
+function renderIssues(){
+  var rows = ISSUES.filter(issueMatches);
+  renderIssueKpis(rows);
+  renderIssueBreakdown(rows);
+  renderAging(rows);
+  renderIssueTable(rows);
+}
+
+$('qArea').addEventListener('change', function(){ buildIssueStoreFilter(); renderIssues(); });
+['qStore','qFocus','qCategory','qPriority','qResolved','qAging','obBy'].forEach(function(id){
   $(id).addEventListener('change', renderIssues);
 });
+$('qSearch').addEventListener('input', renderIssues);
+$('qReset').addEventListener('click', function(){
+  ['qArea','qStore','qFocus','qCategory','qPriority','qResolved','qAging'].forEach(function(id){
+    $(id).value = '';
+  });
+  $('qSearch').value = '';
+  buildIssueStoreFilter();
+  renderIssues();
+});
 
-function loadIssues(){
-  return api('GET', '/api/issues').then(function(j){
+function loadIssues(fresh){
+  return api('GET', '/api/issues' + (fresh ? '?fresh=1' : '')).then(function(j){
     ISSUES = j.rows || [];
+    var warn = $('importWarn');
+    // A failing IMPORTRANGE shows up as #REF! / #N/A rows rather than an error,
+    // so surface it instead of quietly reporting fewer issues than exist.
+    if (j.importErrors && j.importErrors.length) {
+      warn.textContent = 'Some IMPORTRANGE sources are not returning data (' +
+        j.importErrors.join(', ') + '). Check that every store copy is shared and the ' +
+        'ranges are approved — the figures below are incomplete.';
+      warn.classList.remove('hidden');
+    } else {
+      warn.classList.add('hidden');
+    }
     renderIssues();
   }).catch(function(e){ toast('Issues: ' + e.message, true); });
 }
 
 /* =============================== BOOT ================================== */
 
-function loadAll(){
+function loadAll(fresh){
   $('syncNote').textContent = 'Loading...';
-  return api('GET', '/api/data').then(function(j){
+  return api('GET', '/api/data' + (fresh ? '?fresh=1' : '')).then(function(j){
     DATA = j;
     STORE_BY_ID = {};
     DATA.stores.forEach(function(s){ STORE_BY_ID[s.storeId] = s; });
     buildFilters();
-    buildIssueForm();
+    buildIssueFilters();
     renderSales();
     $('syncNote').textContent = 'Synced ' + new Date().toLocaleTimeString();
-    return loadIssues();
+    return loadIssues(fresh);
   }).catch(function(e){
     $('syncNote').textContent = 'Load failed';
     toast(e.message, true);
   });
 }
 
-$('refreshBtn').addEventListener('click', loadAll);
-loadAll();
+$('refreshBtn').addEventListener('click', function(){ loadAll(true); });
+loadAll(false);
 
 })();
 </script>
