@@ -63,6 +63,12 @@ const TAB_ISSUES = 'IssuesAndConcerns';
 const TAB_STORES = 'ListOfStores';
 const TAB_FOCUS = 'Focus5List';
 
+// Stores must refresh FocusSubDept weekly; the week is measured from Monday
+// 00:00 Manila (UTC+8, no DST). All comparisons run in a single "Manila
+// wall-clock" frame (real UTC epoch + 8h) so the server's own timezone and
+// the sheet's serial dates line up without any offset juggling at compare time.
+const MANILA_OFFSET_MS = 8 * 3600 * 1000;
+
 // Issue log columns A..Q, in sheet order.
 const ISSUE_FIELDS = [
   'storeId',            // A  Store ID
@@ -172,6 +178,13 @@ async function readRange(a1) {
   return data.values || [];
 }
 
+// Same, but returns raw values: dates come back as sheet serial numbers rather
+// than locale-formatted strings, which the update tracker needs to compare.
+async function readRangeRaw(a1) {
+  const data = await sheetsApi('GET', '/values/' + encodeURIComponent(a1) + '?valueRenderOption=UNFORMATTED_VALUE');
+  return data.values || [];
+}
+
 /* ============================================================================
  *  HELPERS
  * ==========================================================================*/
@@ -249,9 +262,12 @@ async function loadFocusList() {
 }
 
 async function loadSales(storeById) {
-  // A:J — columns G,H (Diff % / Diff Val) are ignored and recomputed; I is a
-  // spacer; J is the manual "Justification for declined performance" text.
-  const rows = await readRange(TAB_SALES + '!A1:J5000');
+  // A:J. Matches the per-store template: A-H are the entry columns, I is an
+  // auto "last edited" timestamp the store's Apps Script stamps on every row
+  // edit, J is the manual "Justification for declined performance" text.
+  // Read UNFORMATTED so column I arrives as a date serial (not a locale string)
+  // and Sales/Sales LY arrive as numbers (no thousands separators to strip).
+  const rows = await readRangeRaw(TAB_SALES + '!A1:J5000');
   const out = [];
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i] || [];
@@ -262,6 +278,8 @@ async function loadSales(storeById) {
     const sales = num(r[4]);
     const salesLy = num(r[5]);
     const store = storeById[storeId];
+    // Column I: the row's last-edited stamp, used for weekly update tracking.
+    const stampFrame = (typeof r[8] === 'number' && r[8] > 0) ? serialToFrame(r[8]) : null;
     out.push({
       month: month,
       monthIdx: MONTHS.findIndex((m) => m.toLowerCase() === month.toLowerCase()),
@@ -275,6 +293,7 @@ async function loadSales(storeById) {
       // Recomputed rather than trusting the sheet's Diff % / Diff Val columns.
       diffVal: sales - salesLy,
       diffPct: salesLy === 0 ? null : ((sales - salesLy) / salesLy) * 100,
+      stampFrame: stampFrame,
       justification: txt(r[9]),   // column J
     });
   }
@@ -306,12 +325,68 @@ function cached(key, ttlMs, loader) {
 const DATA_TTL = 120000;   // stores / focus list / monthly sales change rarely
 const ISSUES_TTL = 20000;  // the consolidated issue log changes as stores file things
 
+/* ============================================================================
+ *  WEEKLY UPDATE TRACKER — reads the UpdateStatus tab (Store ID -> Last
+ *  Updated, IMPORTRANGEd from each store copy) and works out who has refreshed
+ *  their FocusSubDept data since Monday 00:00 Manila.
+ * ==========================================================================*/
+
+// Start of the current week (Monday 00:00 Manila) in the Manila-frame epoch.
+function manilaWeekStartFrame() {
+  const frame = Date.now() + MANILA_OFFSET_MS;
+  const d = new Date(frame);
+  const day = d.getUTCDay();                 // 0 Sun .. 6 Sat, in Manila terms
+  const sinceMonday = day === 0 ? 6 : day - 1;
+  const midnight = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+  return midnight - sinceMonday * 86400000;
+}
+
+// A sheet serial date (days since 1899-12-30, in the sheet's Manila timezone)
+// as a Manila-frame epoch, so it compares directly with manilaWeekStartFrame().
+function serialToFrame(serial) {
+  return (serial - 25569) * 86400000;
+}
+
+function frameToText(frameMs) {
+  const d = new Date(frameMs);
+  const p = (n) => String(n).padStart(2, '0');
+  return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) +
+    ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes());
+}
+
+// Per-store weekly-update status, derived from the FocusSubDept column-I stamps
+// that the per-store template writes on every edit. A store's "last updated" is
+// the most recent stamp across all its rows — no separate status tab needed.
+function computeUpdates(sales) {
+  const weekStart = manilaWeekStartFrame();
+  const nowFrame = Date.now() + MANILA_OFFSET_MS;
+  const byStore = {};
+  let any = false;
+  for (let i = 0; i < sales.length; i++) {
+    const r = sales[i];
+    if (r.stampFrame == null) continue;
+    any = true;
+    const cur = byStore[r.storeId];
+    if (!cur || r.stampFrame > cur.frame) {
+      byStore[r.storeId] = {
+        frame: r.stampFrame,
+        hasStamp: true,
+        updatedThisWeek: r.stampFrame >= weekStart,
+        daysSince: Math.max(0, Math.floor((nowFrame - r.stampFrame) / 86400000)),
+        lastUpdatedText: frameToText(r.stampFrame),
+      };
+    }
+  }
+  return { configured: any, weekStart: frameToText(weekStart), byStore: byStore };
+}
+
 async function loadReference() {
   const stores = await loadStores();
   const storeById = {};
   stores.forEach((s) => { storeById[s.storeId] = s; });
   const [focusList, sales] = await Promise.all([loadFocusList(), loadSales(storeById)]);
-  return { stores: stores, storeById: storeById, focusList: focusList, sales: sales };
+  const updates = computeUpdates(sales);
+  return { stores: stores, storeById: storeById, focusList: focusList, sales: sales, updates: updates };
 }
 
 app.get('/api/data', async (req, res) => {
@@ -321,7 +396,7 @@ app.get('/api/data', async (req, res) => {
     const ref = await cached('reference', ttl, loadReference);
     res.json({
       stores: ref.stores, focusList: ref.focusList, sales: ref.sales,
-      months: MONTHS, today: todayISO(),
+      updates: ref.updates, months: MONTHS, today: todayISO(),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -703,12 +778,15 @@ table.data td.missing{color:var(--warn);font-style:italic;white-space:normal;min
 
 <section id="tab-compliance" class="tabpane">
 
+  <div id="cUpdateNote" class="warn-bar hidden"></div>
+
   <div class="filters">
     <label>Area<select id="cArea"></select></label>
     <label>Scorecard shows
       <select id="cStatus">
         <option value="flagged">Flagged stores only</option>
         <option value="all">All stores</option>
+        <option value="overdue">Not updated this week</option>
         <option value="clean">Clean stores</option>
         <option value="nodata">No data</option>
       </select>
@@ -1602,13 +1680,24 @@ function complianceScope(){
   return { area: area, sales: sales, issues: issues, stores: stores };
 }
 
-// One record per store: gap counts and a status.
+function updatesConfigured(){
+  return !!(DATA.updates && DATA.updates.configured);
+}
+
+// One record per store: gap counts, weekly-update status, and an overall status.
 function buildScorecard(scope){
+  var configured = updatesConfigured();
   var byStore = {};
   scope.stores.forEach(function(s){
+    var u = (DATA.updates && DATA.updates.byStore && DATA.updates.byStore[s.storeId]) || null;
     byStore[s.storeId] = {
       storeId: s.storeId, storeName: s.storeName, area: s.area,
       unexplained: 0, incomplete: 0, hasSales: false, issueCount: 0,
+      // Weekly update tracking (only meaningful when the tab is configured).
+      hasStamp: u ? u.hasStamp : false,
+      updatedThisWeek: u ? u.updatedThisWeek : false,
+      daysSince: u ? u.daysSince : null,
+      lastUpdatedText: u ? u.lastUpdatedText : '',
     };
   });
   scope.sales.forEach(function(r){
@@ -1627,8 +1716,15 @@ function buildScorecard(scope){
   for (var id in byStore) if (byStore.hasOwnProperty(id)) {
     var r = byStore[id];
     r.totalFlags = r.unexplained + r.incomplete;
-    if (!r.hasSales && r.issueCount === 0) r.status = 'No data';
-    else r.status = r.totalFlags ? 'Flagged' : 'Clean';
+    // Overdue only counts once weekly tracking is set up.
+    r.overdue = configured && !r.updatedThisWeek;
+    if (configured) {
+      r.status = (r.totalFlags || r.overdue) ? 'Flagged' : 'Clean';
+    } else if (!r.hasSales && r.issueCount === 0) {
+      r.status = 'No data';
+    } else {
+      r.status = r.totalFlags ? 'Flagged' : 'Clean';
+    }
     out.push(r);
   }
   return out;
@@ -1638,6 +1734,18 @@ function renderCompliance(){
   if (!DATA.stores || !DATA.stores.length) return;
   var scope = complianceScope();
   var cards = buildScorecard(scope);
+
+  var note = $('cUpdateNote');
+  if (!updatesConfigured()) {
+    note.textContent = 'Weekly update tracking will switch on once FocusSubDept carries the ' +
+      'column-I "last edited" stamp (the per-store script writes it automatically, and it must be ' +
+      'included in the import to the master). Declines and issue completeness are shown regardless.';
+    note.classList.remove('hidden');
+  } else {
+    note.textContent = 'Week of ' + (DATA.updates.weekStart || '') + ' (Mon 00:00 Manila). ' +
+      'A store counts as updated if its latest FocusSubDept edit (column I) is on or after that.';
+    note.classList.remove('hidden');
+  }
 
   renderComplianceKpis(scope, cards);
   renderComplianceAreaChart(cards);
@@ -1664,6 +1772,15 @@ function renderComplianceKpis(scope, cards){
   html += kpi('Stores Flagged', flagged + ' of ' + cards.length,
               noData ? noData + ' with no data yet' : 'across ' + cards.length + ' stores',
               flagged ? 'down' : 'up');
+  if (updatesConfigured()) {
+    var updated = cards.filter(function(c){ return c.updatedThisWeek; }).length;
+    var overdue = cards.filter(function(c){ return c.overdue; }).length;
+    html += kpi('Updated This Week', updated + ' of ' + cards.length,
+                cards.length ? Math.round((updated / cards.length) * 100) + '% on time' : '-',
+                overdue ? 'down' : 'up');
+    html += kpi('Not Updated', String(overdue),
+                overdue ? 'stores overdue this week' : 'everyone is current', overdue ? 'down' : 'up');
+  }
   html += kpi('Fully Clean Stores', String(clean),
               cards.length ? Math.round((clean / cards.length) * 100) + '% of stores' : '-', 'up');
   html += kpi('Unexplained Declines', String(unexplained),
@@ -1757,15 +1874,25 @@ function renderComplianceFieldChart(scope){
   $('cFieldChart').innerHTML = svg;
 }
 
+function updatePill(r){
+  if (!updatesConfigured()) return '<span class="pill st-nodata">n/a</span>';
+  if (r.updatedThisWeek) return '<span class="pill st-closed">✓ This week</span>';
+  if (r.hasStamp) return '<span class="pill st-open">Overdue ' + r.daysSince + 'd</span>';
+  return '<span class="pill st-open">Never</span>';
+}
+
 function renderScorecardTable(cards){
   var show = $('cStatus').value;
   var rows = cards.filter(function(c){
     if (show === 'flagged') return c.status === 'Flagged';
+    if (show === 'overdue') return c.overdue;
     if (show === 'clean') return c.status === 'Clean';
     if (show === 'nodata') return c.status === 'No data';
     return true;
   });
   rows.sort(function(a, b){
+    // Overdue first, then most flags, then name.
+    if (a.overdue !== b.overdue) return a.overdue ? -1 : 1;
     if (b.totalFlags !== a.totalFlags) return b.totalFlags - a.totalFlags;
     return a.storeName < b.storeName ? -1 : 1;
   });
@@ -1773,10 +1900,14 @@ function renderScorecardTable(cards){
   var flagged = cards.filter(function(c){ return c.status === 'Flagged'; }).length;
   $('cScoreCount').textContent = '(' + flagged + ' flagged of ' + cards.length + ')';
 
-  var html = '<thead><tr><th>Store</th><th>Area</th><th class="n">Unexplained Declines</th>' +
+  var showUpd = updatesConfigured();
+  var html = '<thead><tr><th>Store</th><th>Area</th>' +
+    (showUpd ? '<th>Last Updated</th><th>This Week</th>' : '') +
+    '<th class="n">Unexplained Declines</th>' +
     '<th class="n">Incomplete Issues</th><th class="n">Total Flags</th><th>Status</th></tr></thead><tbody>';
+  var colCount = showUpd ? 8 : 6;
   if (!rows.length) {
-    html += '<tr><td colspan="6" class="empty">No stores in this view.</td></tr>';
+    html += '<tr><td colspan="' + colCount + '" class="empty">No stores in this view.</td></tr>';
   }
   for (var i = 0; i < rows.length; i++) {
     var r = rows[i];
@@ -1784,6 +1915,8 @@ function renderScorecardTable(cards){
     html += '<tr>' +
       '<td>' + esc(r.storeId + ' - ' + r.storeName) + '</td>' +
       '<td>' + esc(r.area) + '</td>' +
+      (showUpd ? '<td>' + esc(r.lastUpdatedText || '—') + '</td>' +
+                 '<td>' + updatePill(r) + '</td>' : '') +
       '<td class="n ' + (r.unexplained ? 'down' : '') + '">' + r.unexplained + '</td>' +
       '<td class="n ' + (r.incomplete ? 'down' : '') + '">' + r.incomplete + '</td>' +
       '<td class="n ' + (r.totalFlags ? 'down' : 'up') + '">' + r.totalFlags + '</td>' +
