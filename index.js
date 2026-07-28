@@ -249,7 +249,9 @@ async function loadFocusList() {
 }
 
 async function loadSales(storeById) {
-  const rows = await readRange(TAB_SALES + '!A1:H5000');
+  // A:J — columns G,H (Diff % / Diff Val) are ignored and recomputed; I is a
+  // spacer; J is the manual "Justification for declined performance" text.
+  const rows = await readRange(TAB_SALES + '!A1:J5000');
   const out = [];
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i] || [];
@@ -273,6 +275,7 @@ async function loadSales(storeById) {
       // Recomputed rather than trusting the sheet's Diff % / Diff Val columns.
       diffVal: sales - salesLy,
       diffPct: salesLy === 0 ? null : ((sales - salesLy) / salesLy) * 100,
+      justification: txt(r[9]),   // column J
     });
   }
   return out;
@@ -533,6 +536,10 @@ table.matrix td.cell{text-align:center;font-weight:600}
   padding:11px 14px;margin-bottom:14px;font-size:13px}
 table.data td.wrapcell{white-space:normal;min-width:150px;max-width:280px}
 table.data td.warn{color:var(--warn)}
+table.data td.missing{color:var(--warn);font-style:italic;white-space:normal;min-width:150px}
+.inline-check{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);
+  text-transform:none;letter-spacing:0}
+.inline-check input{width:auto;min-width:0}
 #qSearch{min-width:210px}
 .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(80px);
   background:#101b26;border:1px solid var(--line);border-left:4px solid var(--accent);
@@ -610,6 +617,14 @@ table.data td.warn{color:var(--warn)}
   <div class="card">
     <div class="card-head"><h2>Store &times; Focus Sub-Dept <small>growth % vs last year</small></h2></div>
     <div class="table-scroll"><table id="matrixTable" class="data matrix"></table></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Declined Performance &amp; Justifications <small id="declineCount"></small></h2>
+      <label class="inline-check"><input type="checkbox" id="declineUnexplained"> Only declines without a justification</label>
+    </div>
+    <div class="table-scroll"><table id="declineTable" class="data"></table></div>
   </div>
 </section>
 
@@ -1058,6 +1073,55 @@ function renderMatrix(rows){
   $('matrixTable').innerHTML = html;
 }
 
+// One row per declined Month x Store x Sub-Dept, with the manual justification
+// from column J. This is the only per-row (non-aggregated) view on the Sales
+// tab, because a justification is text and cannot be summed into the KPIs,
+// trend, breakdown or matrix. Declines with no justification are flagged so
+// the table doubles as a follow-up list.
+function renderDeclines(rows){
+  var declines = rows.filter(function(r){ return r.diffVal < 0; });
+  var onlyUnexplained = $('declineUnexplained').checked;
+  if (onlyUnexplained) {
+    declines = declines.filter(function(r){ return !r.justification; });
+  }
+  declines.sort(function(a, b){ return a.diffPct - b.diffPct; });   // worst first
+
+  var unexplained = rows.filter(function(r){ return r.diffVal < 0 && !r.justification; }).length;
+  var totalDeclines = rows.filter(function(r){ return r.diffVal < 0; }).length;
+  $('declineCount').textContent = totalDeclines
+    ? '(' + totalDeclines + ' decline' + (totalDeclines === 1 ? '' : 's') +
+      (unexplained ? ', ' + unexplained + ' unexplained' : '') + ')'
+    : '';
+
+  var html = '<thead><tr><th>Month</th><th>Area</th><th>Store</th><th>Focus Sub-Dept</th>' +
+    '<th class="n">Sales</th><th class="n">Sales LY</th><th class="n">Diff Val</th>' +
+    '<th class="n">Diff %</th><th>Justification</th></tr></thead><tbody>';
+
+  if (!declines.length) {
+    html += '<tr><td colspan="9" class="empty">' +
+      (onlyUnexplained ? 'Every decline in this selection has a justification.'
+                       : 'No declines vs last year in this selection.') + '</td></tr>';
+  }
+  for (var i = 0; i < declines.length; i++) {
+    var r = declines[i];
+    var j = r.justification;
+    html += '<tr>' +
+      '<td>' + esc(r.month) + '</td>' +
+      '<td>' + esc(r.area) + '</td>' +
+      '<td>' + esc(r.storeId + ' - ' + r.storeName) + '</td>' +
+      '<td>' + esc(r.sub) + '</td>' +
+      '<td class="n">' + fmt(r.sales) + '</td>' +
+      '<td class="n">' + fmt(r.salesLy) + '</td>' +
+      '<td class="n down">' + fmt(r.diffVal) + '</td>' +
+      '<td class="n down">' + fmtPct(r.diffPct) + '</td>' +
+      (j ? '<td class="wrapcell" title="' + esc(j) + '">' + esc(j) + '</td>'
+         : '<td class="missing">No justification yet</td>') +
+      '</tr>';
+  }
+  html += '</tbody>';
+  $('declineTable').innerHTML = html;
+}
+
 function renderSales(){
   var rows = filtered();
   renderKpis(rows);
@@ -1078,12 +1142,14 @@ function renderSales(){
   renderBreakdownChart(groups);
   renderBreakdownTable(groups, label);
   renderMatrix(rows);
+  renderDeclines(rows);
 }
 
 $('fArea').addEventListener('change', function(){ buildStoreFilter(); renderSales(); });
 ['fStore','fSub','fFrom','fTo','gBy'].forEach(function(id){
   $(id).addEventListener('change', renderSales);
 });
+$('declineUnexplained').addEventListener('change', function(){ renderDeclines(filtered()); });
 $('fReset').addEventListener('click', function(){
   $('fArea').value = ''; $('fSub').value = '';
   buildStoreFilter();
