@@ -521,6 +521,11 @@ table.data th,table.data td{padding:7px 9px;border-bottom:1px solid var(--line);
   text-align:left;white-space:nowrap}
 table.data th{position:sticky;top:0;background:var(--panel2);z-index:2;
   font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+table.data th.sortable{cursor:pointer;user-select:none;padding-right:16px;position:sticky}
+table.data th.sortable:hover{color:var(--ink)}
+table.data th.sortable::after{content:"\\2195";opacity:.35;margin-left:4px;font-size:10px}
+table.data th.sorted-asc::after{content:"\\2191";opacity:1;color:var(--accent)}
+table.data th.sorted-desc::after{content:"\\2193";opacity:1;color:var(--accent)}
 table.data td.n,table.data th.n{text-align:right;font-variant-numeric:tabular-nums}
 table.data tbody tr:hover{background:#1b2837}
 table.data tfoot td{font-weight:700;border-top:2px solid var(--line);background:var(--panel2)}
@@ -732,6 +737,81 @@ function fmtPct(p){
   return (p > 0 ? '+' : '') + p.toFixed(2) + '%';
 }
 function cls(n){ return n > 0 ? 'up' : (n < 0 ? 'down' : ''); }
+
+/* ---------------------------------------------------------------------------
+ *  Generic table sorting. Every data table rebuilds its innerHTML on render,
+ *  so rather than thread sort state through each render function, this works
+ *  on the DOM: click a header to sort that column, click again to reverse.
+ *  A re-render (e.g. changing a filter) resets the sort, which is fine.
+ * ------------------------------------------------------------------------ */
+
+// Numeric value of a cell for sorting: strips commas, %, currency and spaces.
+// Returns null when the cell is blank or non-numeric (those sort to the end).
+function cellSortValue(td){
+  var text = (td.textContent || '').trim();
+  if (text === '' || text === '-') return { text: text, num: null };
+  var cleaned = text.replace(/[,\s%₱]/g, '');
+  var num = (cleaned !== '' && !isNaN(cleaned)) ? parseFloat(cleaned) : null;
+  return { text: text, num: num };
+}
+
+function makeSortable(table){
+  if (!table || !table.tHead || !table.tBodies[0]) return;
+  var headCells = table.tHead.rows[0].cells;
+  for (var i = 0; i < headCells.length; i++) {
+    (function(th, idx){
+      if (th.getAttribute('data-nosort') === '1') return;
+      th.classList.add('sortable');
+      th.onclick = function(){ sortTableByColumn(table, idx, th); };
+    })(headCells[i], i);
+  }
+}
+
+function sortTableByColumn(table, colIdx, th){
+  var tbody = table.tBodies[0];
+  var rows = [];
+  for (var i = 0; i < tbody.rows.length; i++) rows.push(tbody.rows[i]);
+  var headerCount = table.tHead.rows[0].cells.length;
+  // Bail on the empty-state row (a single cell spanning the whole width).
+  if (rows.length < 2) return;
+  for (var g = 0; g < rows.length; g++) {
+    if (rows[g].cells.length !== headerCount) return;
+  }
+
+  var dir = th.getAttribute('data-sort-dir') === 'asc' ? 'desc' : 'asc';
+  var heads = table.tHead.rows[0].cells;
+  for (var h = 0; h < heads.length; h++) {
+    heads[h].removeAttribute('data-sort-dir');
+    heads[h].classList.remove('sorted-asc', 'sorted-desc');
+  }
+  th.setAttribute('data-sort-dir', dir);
+  th.classList.add(dir === 'asc' ? 'sorted-asc' : 'sorted-desc');
+
+  // Numeric only if every non-blank cell in the column parses as a number.
+  var numeric = true;
+  for (var m = 0; m < rows.length; m++) {
+    var v = cellSortValue(rows[m].cells[colIdx]);
+    if (v.text !== '' && v.text !== '-' && v.num === null) { numeric = false; break; }
+  }
+
+  rows.sort(function(a, b){
+    var av = cellSortValue(a.cells[colIdx]);
+    var bv = cellSortValue(b.cells[colIdx]);
+    var r;
+    if (numeric) {
+      // Blanks always sink to the bottom regardless of direction.
+      var an = av.num === null ? (dir === 'asc' ? Infinity : -Infinity) : av.num;
+      var bn = bv.num === null ? (dir === 'asc' ? Infinity : -Infinity) : bv.num;
+      r = an - bn;
+    } else {
+      var as = av.text.toLowerCase(), bs = bv.text.toLowerCase();
+      r = as < bs ? -1 : (as > bs ? 1 : 0);
+    }
+    return dir === 'asc' ? r : -r;
+  });
+
+  for (var n = 0; n < rows.length; n++) tbody.appendChild(rows[n]);
+}
 
 function toast(msg, isErr){
   var t = $('toast');
@@ -1025,6 +1105,7 @@ function renderBreakdownTable(groups, dimLabel){
     '</td><td class="n">' + fmt(t.ly) + '</td><td class="n ' + cls(tDiff) + '">' + fmt(tDiff) +
     '</td><td class="n ' + cls(tPct) + '">' + fmtPct(tPct) + '</td></tr></tfoot>';
   $('breakdownTable').innerHTML = html;
+  makeSortable($('breakdownTable'));
 }
 
 function renderMatrix(rows){
@@ -1071,6 +1152,7 @@ function renderMatrix(rows){
   }
   html += '</tbody>';
   $('matrixTable').innerHTML = html;
+  makeSortable($('matrixTable'));
 }
 
 // One row per declined Month x Store x Sub-Dept, with the manual justification
@@ -1120,6 +1202,7 @@ function renderDeclines(rows){
   }
   html += '</tbody>';
   $('declineTable').innerHTML = html;
+  makeSortable($('declineTable'));
 }
 
 function renderSales(){
@@ -1375,6 +1458,7 @@ function renderIssueTable(rows){
   }
   html += '</tbody>';
   $('issueTable').innerHTML = html;
+  makeSortable($('issueTable'));
   $('issueCount').textContent = sorted.length === ISSUES.length
     ? '(' + sorted.length + ')'
     : '(' + sorted.length + ' of ' + ISSUES.length + ')';
