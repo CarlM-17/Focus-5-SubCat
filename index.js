@@ -536,6 +536,7 @@ table.matrix td.cell{text-align:center;font-weight:600}
 .p-Low{background:rgba(46,204,143,.18);color:var(--up)}
 .st-open{background:rgba(255,176,32,.18);color:var(--warn)}
 .st-closed{background:rgba(46,204,143,.18);color:var(--up)}
+.st-nodata{background:rgba(147,164,184,.18);color:var(--muted)}
 .warn-bar{background:rgba(255,176,32,.12);border:1px solid rgba(255,176,32,.4);
   border-left:4px solid var(--warn);color:#ffd88a;border-radius:8px;
   padding:11px 14px;margin-bottom:14px;font-size:13px}
@@ -573,6 +574,7 @@ table.data td.missing{color:var(--warn);font-style:italic;white-space:normal;min
 <nav class="tabs">
   <button class="tab active" data-tab="sales" type="button">Sales Monitoring</button>
   <button class="tab" data-tab="issues" type="button">Issue Log</button>
+  <button class="tab" data-tab="compliance" type="button">Compliance Watch</button>
 </nav>
 
 <main>
@@ -697,6 +699,51 @@ table.data td.missing{color:var(--warn);font-style:italic;white-space:normal;min
     </div>
     <div class="table-scroll"><table id="issueTable" class="data"></table></div>
   </div>
+</section>
+
+<section id="tab-compliance" class="tabpane">
+
+  <div class="filters">
+    <label>Area<select id="cArea"></select></label>
+    <label>Scorecard shows
+      <select id="cStatus">
+        <option value="flagged">Flagged stores only</option>
+        <option value="all">All stores</option>
+        <option value="clean">Clean stores</option>
+        <option value="nodata">No data</option>
+      </select>
+    </label>
+    <span class="sync-note" style="align-self:center">Strict rule &middot; declines with no justification + issue entries missing any required field</span>
+  </div>
+
+  <div id="cKpis" class="kpis"></div>
+
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-head"><h2>Flags by Area</h2></div>
+      <div id="cAreaChart" class="chart-wrap"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Most-Missed Issue Fields</h2></div>
+      <div id="cFieldChart" class="chart-wrap"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Store Scorecard <small id="cScoreCount"></small></h2></div>
+    <div class="table-scroll"><table id="cScoreTable" class="data"></table></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Unexplained Declines <small id="cDeclineCount"></small></h2></div>
+    <div class="table-scroll"><table id="cDeclineTable" class="data"></table></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Incomplete Issue Entries <small id="cIssueCount"></small></h2></div>
+    <div class="table-scroll"><table id="cIssueTable" class="data"></table></div>
+  </div>
+
 </section>
 
 </main>
@@ -1506,8 +1553,314 @@ function loadIssues(fresh){
       warn.classList.add('hidden');
     }
     renderIssues();
+    renderCompliance();   // needs ISSUES + DATA, both available by now
   }).catch(function(e){ toast('Issues: ' + e.message, true); });
 }
+
+/* ============================ COMPLIANCE WATCH ============================
+ * Flags two kinds of gap, per store:
+ *   1. Unexplained declines — a Sub-Dept that fell vs LY with a blank column J.
+ *   2. Incomplete issues — an entry missing any STRICT required field.
+ * The audience follows up by store, so the store scorecard is the centre.
+ * ======================================================================= */
+
+// Strict rule: required on every entry.
+var STRICT_REQUIRED = [
+  ['reportedBy', 'Reported by'],
+  ['reportedTo', 'Reported to Buyer/MRG'],
+  ['focusCategory', 'Focus 5'],
+  ['issueCategory', 'Issue Category'],
+  ['issueDescription', 'Description'],
+  ['priority', 'Priority'],
+  ['dateReported', 'Date Reported'],
+  ['feedback', 'Feedback']
+];
+// Additionally required once an issue is marked resolved.
+var RESOLVED_REQUIRED = [
+  ['resolutionDetails', 'Resolution Details'],
+  ['dateResolved', 'Date Resolved']
+];
+
+function missingFields(issue){
+  var miss = [];
+  for (var i = 0; i < STRICT_REQUIRED.length; i++) {
+    if (!String(issue[STRICT_REQUIRED[i][0]] || '').trim()) miss.push(STRICT_REQUIRED[i][1]);
+  }
+  if (String(issue.resolved || '').toUpperCase() === 'Y') {
+    for (var j = 0; j < RESOLVED_REQUIRED.length; j++) {
+      if (!String(issue[RESOLVED_REQUIRED[j][0]] || '').trim()) miss.push(RESOLVED_REQUIRED[j][1]);
+    }
+  }
+  return miss;
+}
+
+function complianceScope(){
+  var area = $('cArea').value;
+  var sales = DATA.sales.filter(function(r){ return !area || r.area === area; });
+  var issues = ISSUES.filter(function(r){ return !area || r.area === area; });
+  var stores = DATA.stores.filter(function(s){ return !area || s.area === area; });
+  return { area: area, sales: sales, issues: issues, stores: stores };
+}
+
+// One record per store: gap counts and a status.
+function buildScorecard(scope){
+  var byStore = {};
+  scope.stores.forEach(function(s){
+    byStore[s.storeId] = {
+      storeId: s.storeId, storeName: s.storeName, area: s.area,
+      unexplained: 0, incomplete: 0, hasSales: false, issueCount: 0,
+    };
+  });
+  scope.sales.forEach(function(r){
+    var row = byStore[r.storeId];
+    if (!row) return;
+    row.hasSales = true;
+    if (r.diffVal < 0 && !r.justification) row.unexplained++;
+  });
+  scope.issues.forEach(function(r){
+    var row = byStore[r.storeId];
+    if (!row) return;
+    row.issueCount++;
+    if (missingFields(r).length) row.incomplete++;
+  });
+  var out = [];
+  for (var id in byStore) if (byStore.hasOwnProperty(id)) {
+    var r = byStore[id];
+    r.totalFlags = r.unexplained + r.incomplete;
+    if (!r.hasSales && r.issueCount === 0) r.status = 'No data';
+    else r.status = r.totalFlags ? 'Flagged' : 'Clean';
+    out.push(r);
+  }
+  return out;
+}
+
+function renderCompliance(){
+  if (!DATA.stores || !DATA.stores.length) return;
+  var scope = complianceScope();
+  var cards = buildScorecard(scope);
+
+  renderComplianceKpis(scope, cards);
+  renderComplianceAreaChart(cards);
+  renderComplianceFieldChart(scope);
+  renderScorecardTable(cards);
+  renderComplianceDeclines(scope);
+  renderComplianceIssues(scope);
+}
+
+function renderComplianceKpis(scope, cards){
+  var flagged = cards.filter(function(c){ return c.status === 'Flagged'; }).length;
+  var clean = cards.filter(function(c){ return c.status === 'Clean'; }).length;
+  var noData = cards.filter(function(c){ return c.status === 'No data'; }).length;
+
+  var declines = scope.sales.filter(function(r){ return r.diffVal < 0; }).length;
+  var unexplained = scope.sales.filter(function(r){ return r.diffVal < 0 && !r.justification; }).length;
+  var totalIssues = scope.issues.length;
+  var incomplete = scope.issues.filter(function(r){ return missingFields(r).length; }).length;
+
+  var issuePct = totalIssues ? Math.round(((totalIssues - incomplete) / totalIssues) * 100) : null;
+  var covPct = declines ? Math.round(((declines - unexplained) / declines) * 100) : null;
+
+  var html = '';
+  html += kpi('Stores Flagged', flagged + ' of ' + cards.length,
+              noData ? noData + ' with no data yet' : 'across ' + cards.length + ' stores',
+              flagged ? 'down' : 'up');
+  html += kpi('Fully Clean Stores', String(clean),
+              cards.length ? Math.round((clean / cards.length) * 100) + '% of stores' : '-', 'up');
+  html += kpi('Unexplained Declines', String(unexplained),
+              'of ' + declines + ' total declines', unexplained ? 'down' : 'up');
+  html += kpi('Incomplete Issues', String(incomplete),
+              'of ' + totalIssues + ' logged', incomplete ? 'down' : 'up');
+  html += kpi('Issue-Log Completeness', issuePct === null ? '-' : issuePct + '%',
+              'entries with every field', (issuePct !== null && issuePct < 80) ? 'down' : 'up');
+  html += kpi('Justification Coverage', covPct === null ? '-' : covPct + '%',
+              'declines explained', (covPct !== null && covPct < 80) ? 'down' : 'up');
+  $('cKpis').innerHTML = html;
+}
+
+function renderComplianceAreaChart(cards){
+  var byArea = {};
+  cards.forEach(function(c){
+    if (!byArea[c.area]) byArea[c.area] = { label: c.area, unexplained: 0, incomplete: 0 };
+    byArea[c.area].unexplained += c.unexplained;
+    byArea[c.area].incomplete += c.incomplete;
+  });
+  var list = [];
+  for (var k in byArea) if (byArea.hasOwnProperty(k)) {
+    byArea[k].total = byArea[k].unexplained + byArea[k].incomplete;
+    list.push(byArea[k]);
+  }
+  list.sort(function(a, b){ return b.total - a.total; });
+  if (!list.length || list.every(function(g){ return g.total === 0; })) {
+    $('cAreaChart').innerHTML = '<div class="empty">No flags in this selection.</div>';
+    return;
+  }
+
+  var rowH = 32, T = 10, B = 26, L = 150, R = 80;
+  var W = 620, pw = W - L - R;
+  var H = T + B + rowH * list.length;
+  var max = 1;
+  list.forEach(function(g){ max = Math.max(max, g.total); });
+
+  var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img">';
+  for (var i = 0; i < list.length; i++) {
+    var g = list[i];
+    var y = T + rowH * i + 6;
+    var uLen = (g.unexplained / max) * pw;
+    var iLen = (g.incomplete / max) * pw;
+    svg += '<text x="' + (L - 10) + '" y="' + (y + 14) + '" fill="#e8eef5" font-size="12" ' +
+           'text-anchor="end">' + esc(g.label.length > 22 ? g.label.slice(0, 21) + '.' : g.label) + '</text>';
+    svg += '<rect x="' + L + '" y="' + y + '" width="' + Math.max(uLen, 0) + '" height="19" rx="3" ' +
+           'fill="#ff8a3d"><title>' + esc(g.label) + ': ' + g.unexplained + ' unexplained declines</title></rect>';
+    svg += '<rect x="' + (L + uLen) + '" y="' + y + '" width="' + Math.max(iLen, 0) + '" height="19" rx="3" ' +
+           'fill="#7c5cff"><title>' + esc(g.label) + ': ' + g.incomplete + ' incomplete issues</title></rect>';
+    svg += '<text x="' + (L + uLen + iLen + 8) + '" y="' + (y + 14) + '" fill="#93a4b8" font-size="11">' +
+           g.total + '</text>';
+  }
+  svg += '<text x="' + L + '" y="' + (H - 8) + '" fill="#ff8a3d" font-size="11">&#9632; Unexplained declines</text>';
+  svg += '<text x="' + (L + 190) + '" y="' + (H - 8) + '" fill="#7c5cff" font-size="11">&#9632; Incomplete issues</text>';
+  svg += '</svg>';
+  $('cAreaChart').innerHTML = svg;
+}
+
+function renderComplianceFieldChart(scope){
+  var counts = {};
+  scope.issues.forEach(function(r){
+    missingFields(r).forEach(function(name){ counts[name] = (counts[name] || 0) + 1; });
+  });
+  var list = [];
+  for (var k in counts) if (counts.hasOwnProperty(k)) list.push({ label: k, n: counts[k] });
+  list.sort(function(a, b){ return b.n - a.n; });
+  if (!list.length) {
+    $('cFieldChart').innerHTML = '<div class="empty">No missing fields in this selection.</div>';
+    return;
+  }
+
+  var rowH = 30, T = 10, B = 12, L = 150, R = 50;
+  var W = 620, pw = W - L - R;
+  var H = T + B + rowH * list.length;
+  var max = 1;
+  list.forEach(function(g){ max = Math.max(max, g.n); });
+
+  var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img">';
+  for (var i = 0; i < list.length; i++) {
+    var g = list[i];
+    var y = T + rowH * i + 5;
+    var len = (g.n / max) * pw;
+    svg += '<text x="' + (L - 10) + '" y="' + (y + 14) + '" fill="#e8eef5" font-size="12" ' +
+           'text-anchor="end">' + esc(g.label) + '</text>';
+    svg += '<rect x="' + L + '" y="' + y + '" width="' + Math.max(len, 1) + '" height="19" rx="3" ' +
+           'fill="#ff5c72"><title>' + esc(g.label) + ' missing on ' + g.n + ' entr' +
+           (g.n === 1 ? 'y' : 'ies') + '</title></rect>';
+    svg += '<text x="' + (L + len + 8) + '" y="' + (y + 14) + '" fill="#93a4b8" font-size="11">' + g.n + '</text>';
+  }
+  svg += '</svg>';
+  $('cFieldChart').innerHTML = svg;
+}
+
+function renderScorecardTable(cards){
+  var show = $('cStatus').value;
+  var rows = cards.filter(function(c){
+    if (show === 'flagged') return c.status === 'Flagged';
+    if (show === 'clean') return c.status === 'Clean';
+    if (show === 'nodata') return c.status === 'No data';
+    return true;
+  });
+  rows.sort(function(a, b){
+    if (b.totalFlags !== a.totalFlags) return b.totalFlags - a.totalFlags;
+    return a.storeName < b.storeName ? -1 : 1;
+  });
+
+  var flagged = cards.filter(function(c){ return c.status === 'Flagged'; }).length;
+  $('cScoreCount').textContent = '(' + flagged + ' flagged of ' + cards.length + ')';
+
+  var html = '<thead><tr><th>Store</th><th>Area</th><th class="n">Unexplained Declines</th>' +
+    '<th class="n">Incomplete Issues</th><th class="n">Total Flags</th><th>Status</th></tr></thead><tbody>';
+  if (!rows.length) {
+    html += '<tr><td colspan="6" class="empty">No stores in this view.</td></tr>';
+  }
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var stCls = r.status === 'Flagged' ? 'st-open' : (r.status === 'Clean' ? 'st-closed' : 'st-nodata');
+    html += '<tr>' +
+      '<td>' + esc(r.storeId + ' - ' + r.storeName) + '</td>' +
+      '<td>' + esc(r.area) + '</td>' +
+      '<td class="n ' + (r.unexplained ? 'down' : '') + '">' + r.unexplained + '</td>' +
+      '<td class="n ' + (r.incomplete ? 'down' : '') + '">' + r.incomplete + '</td>' +
+      '<td class="n ' + (r.totalFlags ? 'down' : 'up') + '">' + r.totalFlags + '</td>' +
+      '<td><span class="pill ' + stCls + '">' + esc(r.status) + '</span></td>' +
+      '</tr>';
+  }
+  html += '</tbody>';
+  $('cScoreTable').innerHTML = html;
+  makeSortable($('cScoreTable'));
+}
+
+function renderComplianceDeclines(scope){
+  var rows = scope.sales.filter(function(r){ return r.diffVal < 0 && !r.justification; });
+  rows.sort(function(a, b){ return a.diffPct - b.diffPct; });
+  $('cDeclineCount').textContent = '(' + rows.length + ')';
+
+  var html = '<thead><tr><th>Month</th><th>Area</th><th>Store</th><th>Focus Sub-Dept</th>' +
+    '<th class="n">Sales</th><th class="n">Sales LY</th><th class="n">Diff Val</th>' +
+    '<th class="n">Diff %</th></tr></thead><tbody>';
+  if (!rows.length) {
+    html += '<tr><td colspan="8" class="empty">Every decline here has a justification.</td></tr>';
+  }
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    html += '<tr>' +
+      '<td>' + esc(r.month) + '</td><td>' + esc(r.area) + '</td>' +
+      '<td>' + esc(r.storeId + ' - ' + r.storeName) + '</td><td>' + esc(r.sub) + '</td>' +
+      '<td class="n">' + fmt(r.sales) + '</td><td class="n">' + fmt(r.salesLy) + '</td>' +
+      '<td class="n down">' + fmt(r.diffVal) + '</td><td class="n down">' + fmtPct(r.diffPct) + '</td></tr>';
+  }
+  html += '</tbody>';
+  $('cDeclineTable').innerHTML = html;
+  makeSortable($('cDeclineTable'));
+}
+
+function renderComplianceIssues(scope){
+  var rows = [];
+  scope.issues.forEach(function(r){
+    var miss = missingFields(r);
+    if (miss.length) rows.push({ rec: r, miss: miss });
+  });
+  rows.sort(function(a, b){ return b.miss.length - a.miss.length; });
+  $('cIssueCount').textContent = '(' + rows.length + ')';
+
+  var html = '<thead><tr><th>Store</th><th>Area</th><th>Focus 5</th><th>Category</th>' +
+    '<th>Description</th><th>Priority</th><th>Reported</th><th>Status</th>' +
+    '<th class="n">Missing</th><th>Missing Fields</th></tr></thead><tbody>';
+  if (!rows.length) {
+    html += '<tr><td colspan="10" class="empty">Every logged issue here is complete.</td></tr>';
+  }
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i].rec, miss = rows[i].miss;
+    html += '<tr>' +
+      '<td>' + esc(r.storeId + (r.storeName ? ' - ' + r.storeName : '')) + '</td>' +
+      '<td>' + esc(r.area) + '</td>' +
+      '<td>' + esc(r.focusCategory) + '</td>' +
+      '<td>' + esc(r.issueCategory) + '</td>' +
+      '<td class="wrapcell" title="' + esc(r.issueDescription) + '">' + esc(clip(r.issueDescription, 40)) + '</td>' +
+      '<td>' + (r.priority ? '<span class="pill p-' + esc(r.priority) + '">' + esc(r.priority) + '</span>' : '') + '</td>' +
+      '<td>' + esc(r.dateReported) + '</td>' +
+      '<td><span class="pill ' + (r.isOpen ? 'st-open">Open' : 'st-closed">Resolved') + '</span></td>' +
+      '<td class="n down">' + miss.length + '</td>' +
+      '<td class="wrapcell missing">' + esc(miss.join(', ')) + '</td>' +
+      '</tr>';
+  }
+  html += '</tbody>';
+  $('cIssueTable').innerHTML = html;
+  makeSortable($('cIssueTable'));
+}
+
+function buildComplianceFilters(){
+  var areas = uniq(DATA.stores.map(function(s){ return s.area; })).sort();
+  fillSelect($('cArea'), areas.map(function(a){ return { v: a, t: a }; }), 'All areas');
+}
+
+$('cArea').addEventListener('change', renderCompliance);
+$('cStatus').addEventListener('change', function(){ renderScorecardTable(buildScorecard(complianceScope())); });
 
 /* =============================== BOOT ================================== */
 
@@ -1519,6 +1872,7 @@ function loadAll(fresh){
     DATA.stores.forEach(function(s){ STORE_BY_ID[s.storeId] = s; });
     buildFilters();
     buildIssueFilters();
+    buildComplianceFilters();
     renderSales();
     $('syncNote').textContent = 'Synced ' + new Date().toLocaleTimeString();
     return loadIssues(fresh);
