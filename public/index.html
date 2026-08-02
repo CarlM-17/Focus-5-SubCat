@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fresh Focus 5 &mdash; CAMANAVA</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">F5</span>
+    <div>
+      <h1>Fresh Focus 5</h1>
+      <p>CAMANAVA &middot; Rice &middot; Poultry &middot; Sugar &middot; Eggs &middot; Pork</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span id="syncNote" class="sync-note"></span>
+    <button id="refreshBtn" class="btn btn-ghost" type="button">Refresh</button>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="sales" type="button">Sales Monitoring</button>
+  <button class="tab" data-tab="issues" type="button">Issue Log</button>
+  <button class="tab" data-tab="compliance" type="button">Compliance Watch</button>
+  <button class="tab" data-tab="exec" type="button">Executive Summary</button>
+</nav>
+
+<main>
+
+<section id="tab-sales" class="tabpane active">
+  <div class="filters">
+    <label>Area<select id="fArea"></select></label>
+    <label>Store<select id="fStore"></select></label>
+    <label>Focus Sub-Dept<select id="fSub"></select></label>
+    <label>From<select id="fFrom"></select></label>
+    <label>To<select id="fTo"></select></label>
+    <button id="fReset" class="btn btn-ghost" type="button">Reset</button>
+  </div>
+
+  <div id="kpis" class="kpis"></div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Monthly Sales Trend</h2>
+      <div class="legend">
+        <span class="key"><i class="sw sw-ty"></i>This Year</span>
+        <span class="key"><i class="sw sw-ly"></i>Last Year</span>
+        <span class="key"><i class="sw sw-gr"></i>Growth %</span>
+      </div>
+    </div>
+    <div id="trendChart" class="chart-wrap"></div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-head">
+        <h2>Growth vs Last Year</h2>
+        <select id="gBy" class="inline-select">
+          <option value="sub">by Focus Sub-Dept</option>
+          <option value="area">by Area</option>
+          <option value="store">by Store</option>
+        </select>
+      </div>
+      <div id="breakdownChart" class="chart-wrap"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Detail</h2></div>
+      <div class="table-scroll"><table id="breakdownTable" class="data"></table></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Store &times; Focus Sub-Dept <small>growth % vs last year</small></h2></div>
+    <div class="table-scroll"><table id="matrixTable" class="data matrix"></table></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Declined Performance &amp; Justifications <small id="declineCount"></small></h2>
+      <label class="inline-check"><input type="checkbox" id="declineUnexplained"> Only declines without a justification</label>
+    </div>
+    <div class="table-scroll"><table id="declineTable" class="data"></table></div>
+  </div>
+</section>
+
+<section id="tab-issues" class="tabpane">
+
+  <div id="importWarn" class="warn-bar hidden"></div>
+
+  <div class="filters">
+    <label>Area<select id="qArea"></select></label>
+    <label>Store<select id="qStore"></select></label>
+    <label>Focus 5<select id="qFocus"></select></label>
+    <label>Issue Category
+      <select id="qCategory">
+        <option value="">All categories</option><option>Price</option><option>Delivery</option>
+        <option>Quality</option><option>CSL</option><option>Other</option>
+      </select>
+    </label>
+    <label>Priority
+      <select id="qPriority">
+        <option value="">All priority</option><option>High</option>
+        <option>Medium</option><option>Low</option>
+      </select>
+    </label>
+    <label>Aging
+      <select id="qAging">
+        <option value="">Any age</option><option value="7">Open &gt; 7 days</option>
+        <option value="14">Open &gt; 14 days</option><option value="30">Open &gt; 30 days</option>
+      </select>
+    </label>
+    <label>Acknowledgement
+      <select id="qAck">
+        <option value="">All</option><option value="unack">Not acknowledged</option>
+        <option value="ack">Acknowledged</option>
+      </select>
+    </label>
+    <label>Search<input id="qSearch" placeholder="Store, description, remarks..."></label>
+    <button id="qReset" class="btn btn-ghost" type="button">Reset</button>
+  </div>
+
+  <div id="issueKpis" class="kpis"></div>
+
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-head">
+        <h2>Open Issues</h2>
+        <select id="obBy" class="inline-select">
+          <option value="issueCategory">by Issue Category</option>
+          <option value="focusCategory">by Focus 5 Category</option>
+          <option value="area">by Area</option>
+          <option value="storeName">by Store</option>
+        </select>
+      </div>
+      <div id="issueBreakdown" class="chart-wrap"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Aging of Open Issues</h2></div>
+      <div id="agingChart" class="chart-wrap"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Consolidated Issue Log <small id="issueCount"></small></h2>
+      <div class="am-bar">
+        <span id="amStatus" class="sync-note">Not signed in as AM</span>
+        <button id="amSignBtn" class="btn btn-ghost btn-sm" type="button">AM sign in</button>
+      </div>
+    </div>
+    <div class="subtabs">
+      <button class="subtab active" data-log="open" type="button">Open <span id="openCount"></span></button>
+      <button class="subtab" data-log="resolved" type="button">Resolved <span id="resolvedCount"></span></button>
+    </div>
+    <div class="table-scroll"><table id="issueTable" class="data"></table></div>
+  </div>
+</section>
+
+<section id="tab-compliance" class="tabpane">
+
+  <div class="filters">
+    <label>Area<select id="cArea"></select></label>
+    <label>Scorecard shows
+      <select id="cStatus">
+        <option value="flagged">Flagged stores only</option>
+        <option value="all">All stores</option>
+        <option value="overdue">Not updated this week</option>
+        <option value="clean">Clean stores</option>
+        <option value="nodata">No data</option>
+      </select>
+    </label>
+    <span class="sync-note" style="align-self:center">Strict rule &middot; declines with no justification + issue entries missing any required field</span>
+  </div>
+
+  <div id="cKpis" class="kpis"></div>
+
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-head"><h2>Flags by Area</h2></div>
+      <div id="cAreaChart" class="chart-wrap"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Most-Missed Issue Fields</h2></div>
+      <div id="cFieldChart" class="chart-wrap"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Sales Update Status <small id="cScoreCount"></small></h2></div>
+    <div class="table-scroll"><table id="cScoreTable" class="data"></table></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Unexplained Declines <small id="cDeclineCount"></small></h2></div>
+    <div class="table-scroll"><table id="cDeclineTable" class="data"></table></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Incomplete Issue Entries <small id="cIssueCount"></small></h2></div>
+    <div class="table-scroll"><table id="cIssueTable" class="data"></table></div>
+  </div>
+
+</section>
+
+<section id="tab-exec" class="tabpane">
+
+  <div class="filters">
+    <label>Area<select id="esArea"></select></label>
+    <label>From<select id="esFrom"></select></label>
+    <label>To<select id="esTo"></select></label>
+    <button id="esReset" class="btn btn-ghost" type="button">Reset</button>
+    <span class="sync-note" style="align-self:center">Auto-generated from declines and their column-J justifications</span>
+  </div>
+
+  <div id="esKpis" class="kpis"></div>
+
+  <div class="card">
+    <div class="card-head"><h2 id="esTitle">Executive Summary</h2></div>
+    <div id="esOverall" class="narr"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Declining Categories &amp; Factors</h2></div>
+    <div id="esDeclines" class="narr"></div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-head"><h2>Factors Affecting Sales</h2></div>
+      <div id="esFactorChart" class="chart-wrap"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Factor Breakdown</h2></div>
+      <div id="esFactorList" class="narr"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Bright Spots</h2></div>
+    <div id="esBright" class="narr"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Watchlist &amp; Recommendations</h2></div>
+    <div class="table-scroll"><table id="esWatchTable" class="data"></table></div>
+    <div id="esWatchNote" class="narr" style="margin-top:12px"></div>
+  </div>
+
+</section>
+
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
